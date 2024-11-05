@@ -448,7 +448,7 @@ class ProcessingConfig:
     crop_height: int = 96
     crop_width: int = 96
     frames_per_clip: int = 25
-    face_margin_factor: float = 0.2
+    face_margin_factor: float = 0.25
     start_idx: int = 48  # Start of mouth landmarks
     stop_idx: int = 68  # End of mouth landmarks
     stable_points: List[int] = field(default_factory=lambda: [33, 36, 39, 42, 45])
@@ -582,44 +582,66 @@ class VideoProcessor:
             self.logger.info(f"Processing video: {video_path}")
 
             # Process frames in batches
-            batch_size = self.config.frames_per_clip
+            batch_size = (
+                self.config.frames_per_clip
+            )  # Use frames_per_clip as batch size
             current_batch = []
-            all_processed_frames = []
+            probabilities = []
 
             # Use generator for frame loading
             for frame_idx, frame in enumerate(self._load_video_frames(video_path)):
                 current_batch.append(frame)
 
-                # Process when batch is full or at end of video
+                # Process when batch is full
                 if len(current_batch) == batch_size:
                     # Process batch of frames
                     landmarks = self._process_landmarks(np.array(current_batch))
                     processed_frames = self._process_mouth_regions(
                         np.array(current_batch), landmarks
                     )
-                    all_processed_frames.extend(processed_frames)
+
+                    if processed_frames and len(processed_frames[0]) > 0:
+                        clips, lengths = processed_frames  # Unpack the tuple
+
+                        # Run inference on this batch
+                        for clip, length in zip(clips, lengths):
+                            if (
+                                clip is not None and clip.size(0) > 0
+                            ):  # Ensure clip is valid
+                                prob = self._run_inference([clip], [length])
+                                if prob is not None and not math.isnan(prob):
+                                    probabilities.append(prob)
 
                     # Clear batch
                     current_batch = []
 
-                # Optional: limit total frames for debugging
-                if frame_idx >= 250:  # Adjust as needed
+                if frame_idx >= 100:
                     break
 
-            # Process any remaining frames
-            if current_batch:
+            # Handle any remaining frames if needed
+            if current_batch and len(current_batch) >= self.config.frames_per_clip:
                 landmarks = self._process_landmarks(np.array(current_batch))
                 processed_frames = self._process_mouth_regions(
                     np.array(current_batch), landmarks
                 )
-                all_processed_frames.extend(processed_frames)
 
-            # Create clips and run inference
-            clips, lengths = self._create_clips(all_processed_frames)
-            probability = self._run_inference(clips, lengths)
+                if processed_frames and len(processed_frames[0]) > 0:
+                    clips, lengths = processed_frames
+                    for clip, length in zip(clips, lengths):
+                        if clip is not None and clip.size(0) > 0:
+                            prob = self._run_inference([clip], [length])
+                            if prob is not None and not math.isnan(prob):
+                                probabilities.append(prob)
 
-            self.logger.info(f"Inference complete. Probability: {probability:.4f}")
-            return probability
+            # Calculate final probability
+            if not probabilities:
+                raise ValueError("No valid predictions were made")
+
+            final_probability = np.mean(probabilities)
+            self.logger.info(
+                f"Inference complete. Probability: {final_probability:.4f}"
+            )
+            return final_probability
 
         except Exception as e:
             self.logger.error(f"Error processing video: {str(e)}")
@@ -632,7 +654,7 @@ class VideoProcessor:
         for frame in tqdm(frames, desc="Processing landmarks"):
             try:
                 # Convert frame format
-                frame_np = frame.numpy()
+                frame_np = frame.numpy() if torch.is_tensor(frame) else frame
 
                 # Detect face
                 boxes, _ = self.face_detector.detect(frame_np)
@@ -679,7 +701,6 @@ class VideoProcessor:
         margin_factor = self.config.face_margin_factor
 
         # Initialize transforms
-        to_pil = transforms.ToPILImage()
         to_tensor = transforms.ToTensor()
         to_gray = transforms.Grayscale()
         resize_face = transforms.Resize((256, 256))
@@ -707,14 +728,12 @@ class VideoProcessor:
             x1, y1, x2, y2 = map(int, box[:4])
             w, h = x2 - x1, y2 - y1
 
-            # Calculate margins based on face size
-            x1_margin = max(0, int(x1 - margin_factor * w))
-            y1_margin = max(0, int(y1 - margin_factor * h))
-            x2_margin = min(frame_np.shape[1], int(x2 + margin_factor * w))
-            y2_margin = min(frame_np.shape[0], int(y2 + margin_factor * h))
-
-            # Crop face with margins
-            face_crop = frame_np[y1_margin:y2_margin, x1_margin:x2_margin]
+            # Calculate margins based on face size and margin factor
+            x1 = max(0, int(x1 - self.config.face_margin_factor * w))
+            y1 = max(0, int(y1 - self.config.face_margin_factor * h))
+            x2 = min(frame_np.shape[1], int(x2 + self.config.face_margin_factor * w))
+            y2 = min(frame_np.shape[0], int(y2 + self.config.face_margin_factor * h))
+            face_crop = frame_np[y1:y2, x1:x2]
 
             # Get landmarks for cropped face
             face_landmarks = self.landmark_detector.get_landmarks(face_crop)
@@ -753,13 +772,6 @@ class VideoProcessor:
             mouth_pil = Image.fromarray(mouth_crop)
             mouth_pil = to_gray(mouth_pil)
             mouth_tensor = to_tensor(mouth_pil)
-
-            # Add debug logging
-            self.logger.debug(f"Frame shape: {frame_np.shape}")
-            self.logger.debug(f"Face crop shape: {face_crop.shape}")
-            self.logger.debug(f"Resized face shape: {face_np.shape}")
-            self.logger.debug(f"Mouth crop shape: {mouth_crop.shape}")
-            self.logger.debug(f"Mouth tensor shape: {mouth_tensor.shape}")
 
             processed_frames.append(mouth_tensor)
 
@@ -848,9 +860,13 @@ class VideoProcessor:
 
         return frame[start_y:end_y, start_x:end_x]
 
-    def _create_clips(self, frames: List[torch.Tensor]) -> List[torch.Tensor]:
+    def _create_clips(
+        self, frames: List[torch.Tensor]
+    ) -> Tuple[List[torch.Tensor], List[List[int]]]:
         """Create clips from processed frames"""
         clips = []
+        lengths = []
+
         for i in range(
             0,
             len(frames) - self.config.frames_per_clip + 1,
@@ -868,23 +884,31 @@ class VideoProcessor:
                 clip = clip.unsqueeze(0)  # Add batch dimension [B, C, T, H, W]
 
                 clips.append(clip)
+                lengths.append(
+                    [self.config.frames_per_clip]
+                )  # Wrap in list for correct format
 
-        return clips, [[self.config.frames_per_clip]] * len(clips)
+        return clips, lengths
 
-    def _run_inference(self, clips: List[torch.Tensor], lengths) -> float:
+    def _run_inference(
+        self, clips: List[torch.Tensor], lengths: List[List[int]]
+    ) -> float:
         """Run inference on processed clips"""
         if not self.forgery_model:
             raise ValueError("Model not loaded. Call load_model() first.")
 
-        probabilities = []
-        with torch.no_grad():
-            for clip, length in zip(clips, lengths):
-                clip = clip.to(self.device)
+        try:
+            with torch.no_grad():
+                clip = clips[0].to(self.device)  # Take first clip
+                length = torch.tensor(
+                    lengths[0], dtype=torch.long, device=self.device
+                )  # Use first length
                 output = self.forgery_model(clip, lengths=length)
                 prob = torch.sigmoid(output).item()
-                probabilities.append(prob)
-
-        return np.mean(probabilities)
+                return prob
+        except Exception as e:
+            self.logger.warning(f"Inference failed: {str(e)}")
+            return None
 
 
 # ============= Usage Example =============
@@ -899,7 +923,7 @@ def main():
     processor.load_model("lipforensics_ff.pth")
 
     # Process video
-    video_path = "046_W010.mp4"
+    video_path = "many_actors_obvious_deepfake_reel.mov"
     try:
         probability = processor.process_video(video_path)
         print(f"Probability of being fake: {probability:.4f}")
