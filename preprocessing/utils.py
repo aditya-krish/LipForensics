@@ -21,8 +21,12 @@ def warp_img(src, dst, img, std_size):
     std_size : tuple
         Target size for frames
     """
-    tform = tf.estimate_transform("similarity", src, dst)  # find the transformation matrix
-    warped = tf.warp(img, inverse_map=tform.inverse, output_shape=std_size)  # wrap the frame image
+    tform = tf.estimate_transform(
+        "similarity", src, dst
+    )  # find the transformation matrix
+    warped = tf.warp(
+        img, inverse_map=tform.inverse, output_shape=std_size
+    )  # wrap the frame image
     warped = warped * 255
     warped = warped.astype("uint8")
     return warped, tform

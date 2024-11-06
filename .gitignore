@@ -8,3 +8,5 @@ __pycache__/
 **/landmarks/**
 
 examples/
+
+**_stash.py

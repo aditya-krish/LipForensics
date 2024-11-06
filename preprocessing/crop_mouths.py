@@ -10,8 +10,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from utils import warp_img, apply_transform, cut_patch
-
+from utils import apply_transform, cut_patch, warp_img
 
 DATASETS = {
     "FaceForensics++": [
@@ -37,7 +36,9 @@ STABLE_POINTS = [33, 36, 39, 42, 45]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Pre-processing")
-    parser.add_argument("--data-root", help="Root path of datasets", type=str, default="./data/datasets")
+    parser.add_argument(
+        "--data-root", help="Root path of datasets", type=str, default="./data/datasets"
+    )
     parser.add_argument(
         "--dataset",
         help="Dataset to preprocess",
@@ -64,18 +65,37 @@ def parse_args():
         choices=["c0", "c23", "c40"],
         default="c23",
     )
-    parser.add_argument("--mean-face", default="./preprocessing/20words_mean_face.npy", help="Mean face pathname")
-    parser.add_argument("--crop-width", default=96, type=int, help="Width of mouth ROIs")
-    parser.add_argument("--crop-height", default=96, type=int, help="Height of mouth ROIs")
-    parser.add_argument("--start-idx", default=48, type=int, help="Start of landmark index for mouth")
-    parser.add_argument("--stop-idx", default=68, type=int, help="End of landmark index for mouth")
-    parser.add_argument("--window-margin", default=12, type=int, help="Window margin for smoothed_landmarks")
+    parser.add_argument(
+        "--mean-face",
+        default="./preprocessing/20words_mean_face.npy",
+        help="Mean face pathname",
+    )
+    parser.add_argument(
+        "--crop-width", default=96, type=int, help="Width of mouth ROIs"
+    )
+    parser.add_argument(
+        "--crop-height", default=96, type=int, help="Height of mouth ROIs"
+    )
+    parser.add_argument(
+        "--start-idx", default=48, type=int, help="Start of landmark index for mouth"
+    )
+    parser.add_argument(
+        "--stop-idx", default=68, type=int, help="End of landmark index for mouth"
+    )
+    parser.add_argument(
+        "--window-margin",
+        default=12,
+        type=int,
+        help="Window margin for smoothed_landmarks",
+    )
 
     args = parser.parse_args()
     return args
 
 
-def crop_video_and_save(video_path, landmarks_dir, target_dir, mean_face_landmarks, args):
+def crop_video_and_save(
+    video_path, landmarks_dir, target_dir, mean_face_landmarks, args
+):
     """ "
     Align frames and crop mouths. The landmarks are smoothed over 12 frames to account for motion jitter, and each frame
     is affine warped to the mean face via five landmarks (around the eyes and nose). The mouth is cropped in each frame
@@ -118,7 +138,10 @@ def crop_video_and_save(video_path, landmarks_dir, target_dir, mean_face_landmar
 
             # Get aligned frame as well as affine transformation that produced it
             trans_frame, trans = warp_img(
-                smoothed_landmarks[STABLE_POINTS, :], mean_face_landmarks[STABLE_POINTS, :], cur_frame, STD_SIZE
+                smoothed_landmarks[STABLE_POINTS, :],
+                mean_face_landmarks[STABLE_POINTS, :],
+                cur_frame,
+                STD_SIZE,
             )
 
             # Apply that affine transform to the landmarks
@@ -146,7 +169,10 @@ def crop_video_and_save(video_path, landmarks_dir, target_dir, mean_face_landmar
         trans_landmarks = trans(cur_landmarks)
 
         cropped_frame = cut_patch(
-            trans_frame, trans_landmarks[args.start_idx : args.stop_idx], args.crop_height // 2, args.crop_width // 2
+            trans_frame,
+            trans_landmarks[args.start_idx : args.stop_idx],
+            args.crop_height // 2,
+            args.crop_width // 2,
         )
 
         target_path = os.path.join(target_dir, cur_name)
@@ -176,7 +202,9 @@ def main():
 
     for dataset in datasets:
         compression = (
-            args.compression if dataset not in ("CelebDF/RealCelebDF", "CelebDF/FakeCelebDF", "DFDC") else ""
+            args.compression
+            if dataset not in ("CelebDF/RealCelebDF", "CelebDF/FakeCelebDF", "DFDC")
+            else ""
         )
         root = os.path.join(args.data_root, dataset, compression)
         videos_root = os.path.join(root, "images")
@@ -190,7 +218,9 @@ def main():
             video_dir = os.path.join(videos_root, video)
             landmarks_dir = os.path.join(landmarks_root, video)
 
-            crop_video_and_save(video_dir, landmarks_dir, target_dir, mean_face_landmarks, args)
+            crop_video_and_save(
+                video_dir, landmarks_dir, target_dir, mean_face_landmarks, args
+            )
 
 
 if __name__ == "__main__":

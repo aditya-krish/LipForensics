@@ -4,15 +4,15 @@ import argparse
 from collections import defaultdict
 
 import pandas as pd
-from sklearn import metrics
 import torch
+from sklearn import metrics
 from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, CenterCrop
+from torchvision.transforms import CenterCrop, Compose
 from tqdm import tqdm
 
-from data.transforms import NormalizeVideo, ToTensorVideo
-from data.dataset_clips import ForensicsClips, CelebDFClips, DFDCClips
+from data.dataset_clips import CelebDFClips, DFDCClips, ForensicsClips
 from data.samplers import ConsecutiveClipSampler
+from data.transforms import NormalizeVideo, ToTensorVideo
 from models.spatiotemporal_net import get_model
 from utils import get_files_from_split
 
@@ -48,19 +48,27 @@ def parse_args():
     parser.set_defaults(grayscale=True)
     parser.add_argument("--frames_per_clip", default=25, type=int)
     parser.add_argument("--batch_size", default=32, type=int)
-    parser.add_argument("--device", help="Device to put tensors on", type=str, default="cuda:0")
+    parser.add_argument(
+        "--device", help="Device to put tensors on", type=str, default="cuda:0"
+    )
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument(
         "--weights_forgery_path",
         help="Path to pretrained weights for forgery detection",
         type=str,
-        default="./models/weights/lipforensics_ff.pth"
+        default="./models/weights/lipforensics_ff.pth",
     )
     parser.add_argument(
-        "--split_path", help="Path to FF++ splits", type=str, default="./data/datasets/Forensics/splits/test.json"
+        "--split_path",
+        help="Path to FF++ splits",
+        type=str,
+        default="./data/datasets/Forensics/splits/test.json",
     )
     parser.add_argument(
-        "--dfdc_metadata_path", help="Path to DFDC metadata", type=str, default="./data/datasets/DFDC/metadata.json"
+        "--dfdc_metadata_path",
+        help="Path to DFDC metadata",
+        type=str,
+        default="./data/datasets/DFDC/metadata.json",
     )
 
     args = parser.parse_args()
@@ -80,11 +88,18 @@ def compute_video_level_auc(video_to_logits, video_to_labels):
         Maps video ids to label
     """
     output_batch = torch.stack(
-        [torch.mean(torch.stack(video_to_logits[video_id]), 0, keepdim=False) for video_id in video_to_logits.keys()]
+        [
+            torch.mean(torch.stack(video_to_logits[video_id]), 0, keepdim=False)
+            for video_id in video_to_logits.keys()
+        ]
     )
-    output_labels = torch.stack([video_to_labels[video_id] for video_id in video_to_logits.keys()])
+    output_labels = torch.stack(
+        [video_to_labels[video_id] for video_id in video_to_logits.keys()]
+    )
 
-    fpr, tpr, _ = metrics.roc_curve(output_labels.cpu().numpy(), output_batch.cpu().numpy())
+    fpr, tpr, _ = metrics.roc_curve(
+        output_labels.cpu().numpy(), output_batch.cpu().numpy()
+    )
     return metrics.auc(fpr, tpr)
 
 
@@ -169,7 +184,12 @@ def main():
     # Get sampler that splits video into non-overlapping clips
     sampler = ConsecutiveClipSampler(dataset.clips_per_video)
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
 
     auc = validate_video_level(model, loader, args)
     print(args.dataset, f"AUC (video-level): {auc}")
