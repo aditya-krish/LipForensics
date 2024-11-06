@@ -3,7 +3,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict
 
 import face_alignment
 import matplotlib.pyplot as plt
@@ -575,167 +575,276 @@ class VideoProcessor:
         finally:
             cap.release()
 
-    def process_video(self, video_path: Union[str, Path]) -> float:
-        """Process a video file and return probability of being fake"""
+    def process_video(self, video_path: Union[str, Path]) -> Dict[int, float]:
+        """Process video and return forgery probabilities for each face"""
+        self.logger.info(f"Processing video: {video_path}")
+
         try:
-            self.logger.info(f"Processing video: {video_path}")
+            # Initialize video capture
+            self.logger.debug("Loading video frames")
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                raise ValueError("Failed to open video file")
 
-            # Process frames in batches
-            batch_size = 110
+            # Initialize batch processing
             current_batch = []
-            probabilities = []
+            batch_size = 110  # Adjust as needed
+            frame_count = 0
+            face_probabilities = {}
 
-            normalize_clip = NormalizeVideo((0.421,), (0.165,))
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # Use generator for frame loading
-            for frame_idx, frame in enumerate(self._load_video_frames(video_path)):
-                current_batch.append(frame)
+                frame_count += 1
+                frame_idx = frame_count - 1
+
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                current_batch.append(frame_rgb)
 
                 # Process when batch is full
                 if len(current_batch) == batch_size:
-                    # Process batch of frames
-                    processed_frames = self._process_mouth_regions(
-                        np.array(current_batch)
+                    self.logger.debug(
+                        f"Processing batch of {len(current_batch)} frames"
                     )
 
-                    if processed_frames and len(processed_frames[0]) > 0:
-                        clips, lengths = processed_frames  # Unpack the tuple
-
-                        # Run inference on this batch
-                        for clip, length in zip(clips, lengths):
-                            if (
-                                clip is not None and clip.size(0) > 0
-                            ):  # Ensure clip is valid
-                                clip = normalize_clip(clip)
-                                prob = self._run_inference([clip], [length])
-                                if prob is not None and not math.isnan(prob):
-                                    probabilities.append(prob)
+                    # Process batch of frames
+                    try:
+                        batch_probabilities = self._process_mouth_regions(
+                            np.array(current_batch)
+                        )
+                        # Merge probabilities
+                        face_probabilities.update(batch_probabilities)
+                    except Exception as e:
+                        self.logger.error(f"Error processing batch: {str(e)}")
 
                     # Clear batch
                     current_batch = []
 
-                if frame_idx >= 100:
+                if frame_idx >= 120:
                     break
 
-            # Handle any remaining frames if needed
-            if current_batch and len(current_batch) >= self.config.frames_per_clip:
-                processed_frames = self._process_mouth_regions(np.array(current_batch))
+            self.logger.debug(f"Processed {frame_count} frames total")
+            self.logger.debug(f"Face probabilities collected: {face_probabilities}")
 
-                if processed_frames and len(processed_frames[0]) > 0:
-                    clips, lengths = processed_frames
-                    for clip, length in zip(clips, lengths):
-                        if clip is not None and clip.size(0) > 0:
-                            prob = self._run_inference([clip], [length])
-                            if prob is not None and not math.isnan(prob):
-                                probabilities.append(prob)
-
-            # Calculate final probability
-            if not probabilities:
+            if not face_probabilities:
                 raise ValueError("No valid predictions were made")
 
-            final_probability = np.mean(probabilities)
             self.logger.info(
-                f"Inference complete. Probability: {final_probability:.4f}"
+                f"Inference complete. Probabilities per face: {face_probabilities}"
             )
-            return final_probability
+            return face_probabilities
 
         except Exception as e:
             self.logger.error(f"Error processing video: {str(e)}")
             raise
 
-    def _process_mouth_regions(self, frames: torch.Tensor) -> List[torch.Tensor]:
+    def _process_mouth_regions(self, frames: torch.Tensor) -> Dict[int, float]:
         """Extract and process mouth regions from frames"""
-        processed_frames = []
-
-        margin_factor = self.config.face_margin_factor
-
+        face_frames = {}  # face_id -> list of frames
+        face_probabilities = {}  # face_id -> list of probabilities
+        
         # Initialize transforms
         to_tensor = transforms.ToTensor()
         to_gray = transforms.Grayscale()
         resize_face = transforms.Resize((256, 256))
+        normalize_clip = NormalizeVideo((0.421,), (0.165,))
 
-        for frame in tqdm(frames, desc="Processing frames"):
-            # Ensure frame is in the correct format (H, W, C)
+        # Pre-detect faces for all frames in batch to avoid redundant work
+        batch_boxes = []
+        batch_scores = []
+        for frame in frames:
             if isinstance(frame, torch.Tensor):
-                if frame.dim() == 3 and frame.shape[0] == 3:
-                    frame = frame.permute(1, 2, 0)
-                frame_np = frame.numpy()
-            else:
-                frame_np = frame
+                frame = frame.numpy()
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).astype(np.uint8)
+                
+            boxes, scores = self.face_detector.detect(frame)
+            batch_boxes.append(boxes if boxes is not None else np.array([]))
+            batch_scores.append(scores if scores is not None else np.array([]))
 
-            # Convert to uint8 if needed
-            if frame_np.dtype != np.uint8:
-                frame_np = (frame_np * 255).astype(np.uint8)
+        prev_boxes = None
+        face_id_counter = 0
+        current_face_ids = []
 
-            # Detect face
-            boxes, _ = self.face_detector.detect(frame_np)
-            if boxes is None or len(boxes) == 0:
-                continue
+        self.logger.debug(f"Starting to process batch of {len(frames)} frames")
 
-            # Get face crop coordinates with margin factor
-            box = boxes[0]
-            x1, y1, x2, y2 = map(int, box[:4])
-            w, h = x2 - x1, y2 - y1
+        # Process each frame using pre-detected faces
+        for frame_idx, (frame, boxes, scores) in enumerate(zip(frames, batch_boxes, batch_scores)):
+            try:
+                if len(boxes) == 0:
+                    self.logger.debug(f"No faces detected in frame {frame_idx}")
+                    continue
 
-            # Calculate margins based on face size and margin factor
-            x1 = max(0, int(x1 - self.config.face_margin_factor * w))
-            y1 = max(0, int(y1 - self.config.face_margin_factor * h))
-            x2 = min(frame_np.shape[1], int(x2 + self.config.face_margin_factor * w))
-            y2 = min(frame_np.shape[0], int(y2 + self.config.face_margin_factor * h))
-            face_crop = frame_np[y1:y2, x1:x2]
-
-            # Get landmarks for cropped face
-            face_landmarks = self.landmark_detector.get_landmarks(face_crop)
-            if face_landmarks is None:
-                continue
-
-            # Convert cropped face to PIL and resize
-            face_pil = Image.fromarray(face_crop)
-            face_pil = resize_face(face_pil)
-            face_np = np.array(face_pil)
-
-            # Scale landmarks to match resized face
-            scale_x = 256 / face_crop.shape[1]
-            scale_y = 256 / face_crop.shape[0]
-            landmarks_scaled = face_landmarks[0].copy()
-            landmarks_scaled[:, 0] *= scale_x
-            landmarks_scaled[:, 1] *= scale_y
-
-            # Get mouth landmarks and center
-            mouth_landmarks = landmarks_scaled[
-                self.config.start_idx : self.config.stop_idx
-            ]
-            mouth_center = np.mean(mouth_landmarks, axis=0)
-
-            # Crop 96x96 around mouth center
-            half_size = 44  # 88/2
-            start_x = int(max(0, mouth_center[0] - half_size))
-            end_x = int(min(256, mouth_center[0] + half_size))
-            start_y = int(max(0, mouth_center[1] - half_size))
-            end_y = int(min(256, mouth_center[1] + half_size))
-
-            # Crop mouth region
-            mouth_crop = face_np[start_y:end_y, start_x:end_x]
-
-            # Convert to grayscale and tensor
-            mouth_pil = Image.fromarray(mouth_crop)
-            mouth_pil = to_gray(mouth_pil)
-            mouth_tensor = to_tensor(mouth_pil)
-
-            processed_frames.append(mouth_tensor)
-
-            if self.config.debug_mode:
-                self._visualize_debug(
-                    face_np,
-                    landmarks_scaled,
-                    np.array(mouth_pil),
-                    f"frame_{len(processed_frames)}",
+                self.logger.debug(
+                    f"Frame {frame_idx}: Detected {len(boxes)} faces with scores: {scores}"
                 )
 
-        if not processed_frames:
-            raise ValueError("No valid mouth regions were processed")
+                # Match current faces with previous faces
+                if prev_boxes is not None:
+                    # Calculate all IOUs at once using vectorized operations
+                    current_face_ids = [-1] * len(boxes)
+                    for i, curr_box in enumerate(boxes):
+                        ious = np.array([self._calculate_iou(curr_box, prev_box) for prev_box in prev_boxes.values()])
+                        if len(ious) > 0:
+                            max_iou_idx = np.argmax(ious)
+                            max_iou = ious[max_iou_idx]
+                            if max_iou > 0.5:  # IOU threshold
+                                current_face_ids[i] = list(prev_boxes.keys())[max_iou_idx]
+                    
+                    # Assign new IDs to unmatched faces
+                    for i in range(len(boxes)):
+                        if current_face_ids[i] == -1:
+                            current_face_ids[i] = face_id_counter
+                            face_id_counter += 1
+                else:
+                    # First frame, assign new IDs to all faces
+                    current_face_ids = list(range(len(boxes)))
+                    face_id_counter = len(boxes)
 
-        return self._create_clips(processed_frames)
+                # Update previous boxes for next frame
+                prev_boxes = {
+                    face_id: box for face_id, box in zip(current_face_ids, boxes)
+                }
+
+                # Process each detected face
+                for face_idx, (box, score) in enumerate(zip(boxes, scores)):
+                    if score < 0.9:
+                        continue
+
+                    # Get face crop
+                    x1, y1, x2, y2 = map(int, box[:4])
+                    w, h = x2 - x1, y2 - y1
+
+                    # Add margin
+                    margin_x = int(w * self.config.face_margin_factor)
+                    margin_y = int(h * self.config.face_margin_factor)
+
+                    x1 = max(0, x1 - margin_x)
+                    y1 = max(0, y1 - margin_y)
+                    x2 = min(frame.shape[1], x2 + margin_x)
+                    y2 = min(frame.shape[0], y2 + margin_y)
+
+                    face_crop = frame[y1:y2, x1:x2]
+
+                    # Save first frame face crops for debugging
+                    if frame_idx == 0 and self.config.debug_mode:
+                        debug_dir = Path("debug_output")
+                        debug_dir.mkdir(exist_ok=True)
+                        Image.fromarray(face_crop).save(
+                            debug_dir / f"face_{face_idx}_crop.png"
+                        )
+
+                    # Get landmarks
+                    face_landmarks = self.landmark_detector.get_landmarks(face_crop)
+                    if face_landmarks is None:
+                        self.logger.debug(
+                            f"No landmarks detected for face {face_idx} in frame {frame_idx}"
+                        )
+                        continue
+
+                    # Convert cropped face to PIL and resize
+                    face_pil = Image.fromarray(face_crop)
+                    face_pil = resize_face(face_pil)
+                    face_np = np.array(face_pil)
+
+                    # Scale landmarks to match resized face
+                    scale_x = 256 / face_crop.shape[1]
+                    scale_y = 256 / face_crop.shape[0]
+                    landmarks_scaled = face_landmarks[0].copy()
+                    landmarks_scaled[:, 0] *= scale_x
+                    landmarks_scaled[:, 1] *= scale_y
+
+                    # Get mouth landmarks and center
+                    mouth_landmarks = landmarks_scaled[
+                        self.config.start_idx : self.config.stop_idx
+                    ]
+                    mouth_center = np.mean(mouth_landmarks, axis=0)
+
+                    # Crop 96x96 around mouth center
+                    half_size = 44  # 88/2
+                    start_x = int(max(0, mouth_center[0] - half_size))
+                    end_x = int(min(256, mouth_center[0] + half_size))
+                    start_y = int(max(0, mouth_center[1] - half_size))
+                    end_y = int(min(256, mouth_center[1] + half_size))
+
+                    # Crop mouth region
+                    mouth_crop = face_np[start_y:end_y, start_x:end_x]
+                    mouth_pil = Image.fromarray(mouth_crop)
+                    mouth_pil = to_gray(mouth_pil)
+                    mouth_tensor = to_tensor(mouth_pil)
+
+                    # Store processed frame with face ID
+                    face_id = current_face_ids[face_idx]
+                    if face_id not in face_frames:
+                        face_frames[face_id] = []
+                    face_frames[face_id].append(mouth_tensor)
+
+                    if self.config.debug_mode:
+                        self._visualize_debug(
+                            face_np,
+                            landmarks_scaled,
+                            np.array(mouth_pil),
+                            f"frame_{frame_idx}_face_{face_id}",
+                        )
+
+            except Exception as e:
+                self.logger.error(f"Error processing frame {frame_idx}: {str(e)}")
+                continue
+
+        # Process clips for each face
+        for face_id, frames in face_frames.items():
+            if len(frames) >= self.config.frames_per_clip:
+                self.logger.debug(
+                    f"Creating clips for face {face_id} with {len(frames)} frames"
+                )
+                clips, lengths = self._create_clips(frames)
+
+                # Run inference on each clip for this face
+                face_probs = []
+                for clip, length in zip(clips, lengths):
+                    if clip is not None and clip.size(0) > 0:
+                        clip = normalize_clip(clip)
+                        prob = self._run_inference([clip], [length])
+                        if prob is not None and not math.isnan(prob):
+                            face_probs.append(prob)
+
+                # Store average probability for this face
+                if face_probs:
+                    face_probabilities[face_id] = np.mean(face_probs)
+
+        if not face_probabilities:
+            raise ValueError("No valid predictions were made")
+
+        self.logger.info(
+            f"Inference complete. Probabilities per face: {face_probabilities}"
+        )
+        return face_probabilities
+
+    def _calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union between two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = map(int, box1[:4])
+        x1_2, y1_2, x2_2, y2_2 = map(int, box2[:4])
+
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+
+        # Calculate union
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+
+        return intersection / union if union > 0 else 0.0
 
     def _visualize_debug(
         self,
@@ -872,10 +981,11 @@ def main():
     processor.load_model("lipforensics_ff.pth")
 
     # Process video
-    video_path = "many_actors_obvious_deepfake_reel.mov"
+    video_path = "Lip Sync - Musk.mp4"
     try:
-        probability = processor.process_video(video_path)
-        print(f"Probability of being fake: {probability:.4f}")
+        face_probabilities = processor.process_video(video_path)
+        for face_id, probability in face_probabilities.items():
+            print(f"Face {face_id} - Probability of being fake: {probability:.4f}")
     except Exception as e:
         print(f"Error processing video: {str(e)}")
 
