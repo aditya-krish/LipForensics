@@ -14,7 +14,6 @@ from facenet_pytorch import MTCNN
 from PIL import Image
 from skimage import transform as tf
 from torchvision import transforms
-from torchvision.io import read_video
 from torchvision.transforms import CenterCrop, Compose
 from tqdm import tqdm
 
@@ -582,11 +581,11 @@ class VideoProcessor:
             self.logger.info(f"Processing video: {video_path}")
 
             # Process frames in batches
-            batch_size = (
-                self.config.frames_per_clip
-            )  # Use frames_per_clip as batch size
+            batch_size = 110
             current_batch = []
             probabilities = []
+
+            normalize_clip = NormalizeVideo((0.421,), (0.165,))
 
             # Use generator for frame loading
             for frame_idx, frame in enumerate(self._load_video_frames(video_path)):
@@ -595,9 +594,8 @@ class VideoProcessor:
                 # Process when batch is full
                 if len(current_batch) == batch_size:
                     # Process batch of frames
-                    landmarks = self._process_landmarks(np.array(current_batch))
                     processed_frames = self._process_mouth_regions(
-                        np.array(current_batch), landmarks
+                        np.array(current_batch)
                     )
 
                     if processed_frames and len(processed_frames[0]) > 0:
@@ -608,6 +606,7 @@ class VideoProcessor:
                             if (
                                 clip is not None and clip.size(0) > 0
                             ):  # Ensure clip is valid
+                                clip = normalize_clip(clip)
                                 prob = self._run_inference([clip], [length])
                                 if prob is not None and not math.isnan(prob):
                                     probabilities.append(prob)
@@ -620,10 +619,7 @@ class VideoProcessor:
 
             # Handle any remaining frames if needed
             if current_batch and len(current_batch) >= self.config.frames_per_clip:
-                landmarks = self._process_landmarks(np.array(current_batch))
-                processed_frames = self._process_mouth_regions(
-                    np.array(current_batch), landmarks
-                )
+                processed_frames = self._process_mouth_regions(np.array(current_batch))
 
                 if processed_frames and len(processed_frames[0]) > 0:
                     clips, lengths = processed_frames
@@ -647,54 +643,7 @@ class VideoProcessor:
             self.logger.error(f"Error processing video: {str(e)}")
             raise
 
-    def _process_landmarks(self, frames: torch.Tensor) -> List[np.ndarray]:
-        """Process frames to extract facial landmarks"""
-        landmarks_list = []
-
-        for frame in tqdm(frames, desc="Processing landmarks"):
-            try:
-                # Convert frame format
-                frame_np = frame.numpy() if torch.is_tensor(frame) else frame
-
-                # Detect face
-                boxes, _ = self.face_detector.detect(frame_np)
-                if boxes is None or len(boxes) == 0:
-                    self.logger.warning("No face detected in frame")
-                    continue
-
-                # Get face crop
-                box = boxes[0]
-                margin = 20
-                x1, y1, x2, y2 = map(int, box[:4])
-                x1 = max(0, x1 - margin)
-                y1 = max(0, y1 - margin)
-                x2 = min(frame_np.shape[1], x2 + margin)
-                y2 = min(frame_np.shape[0], y2 + margin)
-                face_crop = frame_np[y1:y2, x1:x2]
-
-                # Get landmarks
-                landmarks = self.landmark_detector.get_landmarks(face_crop)
-                if landmarks is None:
-                    self.logger.warning("No landmarks detected in face")
-                    continue
-
-                landmarks_list.append(landmarks[0])
-
-                # if self.config.debug_mode:
-                #     self._visualize_debug(frame_np, landmarks[0], face_crop, f"frame_{len(landmarks_list)}")
-
-            except Exception as e:
-                self.logger.warning(f"Error processing frame landmarks: {str(e)}")
-                continue
-
-        if not landmarks_list:
-            raise ValueError("No valid landmarks detected in video")
-
-        return landmarks_list
-
-    def _process_mouth_regions(
-        self, frames: torch.Tensor, landmarks: List[np.ndarray]
-    ) -> List[torch.Tensor]:
+    def _process_mouth_regions(self, frames: torch.Tensor) -> List[torch.Tensor]:
         """Extract and process mouth regions from frames"""
         processed_frames = []
 
@@ -759,7 +708,7 @@ class VideoProcessor:
             mouth_center = np.mean(mouth_landmarks, axis=0)
 
             # Crop 96x96 around mouth center
-            half_size = 48  # 96/2
+            half_size = 44  # 88/2
             start_x = int(max(0, mouth_center[0] - half_size))
             end_x = int(min(256, mouth_center[0] + half_size))
             start_y = int(max(0, mouth_center[1] - half_size))
