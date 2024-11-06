@@ -1,5 +1,6 @@
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
@@ -441,8 +442,8 @@ class ProcessingConfig:
     """Configuration for video processing parameters"""
 
     window_margin: int = 12
-    crop_height: int = 96
-    crop_width: int = 96
+    crop_height: int = 88
+    crop_width: int = 88
     frames_per_clip: int = 25
     face_margin_factor: float = 0.25
     start_idx: int = 48  # Start of mouth landmarks
@@ -675,12 +676,19 @@ class VideoProcessor:
         """Extract mouth regions from frames and return dictionary of face_id -> frames"""
         face_frames = {}  # face_id -> list of frames
 
+        # Load mean face landmarks if not already loaded
+        if not hasattr(self, "mean_face_landmarks"):
+            mean_face_path = "20words_mean_face.npy"  # You'll need this file
+            self.mean_face_landmarks = np.load(mean_face_path)
+
         # Initialize transforms
         to_tensor = transforms.ToTensor()
         to_gray = transforms.Grayscale()
-        resize_face = transforms.Resize((256, 256))
 
-        # Pre-detect faces for all frames in batch to avoid redundant work
+        # Use deque for landmark smoothing
+        q_landmarks = deque(maxlen=self.config.window_margin)
+
+        # Pre-detect faces for all frames in batch
         batch_boxes = []
         batch_scores = []
         for frame in frames:
@@ -697,24 +705,16 @@ class VideoProcessor:
         face_id_counter = 0
         current_face_ids = []
 
-        self.logger.debug(f"Starting to process batch of {len(frames)} frames")
-
-        # Process each frame using pre-detected faces
+        # Process each frame
         for frame_idx, (frame, boxes, scores) in enumerate(
             zip(frames, batch_boxes, batch_scores)
         ):
             try:
                 if len(boxes) == 0:
-                    self.logger.debug(f"No faces detected in frame {frame_idx}")
                     continue
 
-                self.logger.debug(
-                    f"Frame {frame_idx}: Detected {len(boxes)} faces with scores: {scores}"
-                )
-
-                # Match current faces with previous faces
+                # Match current faces with previous faces and assign IDs
                 if prev_boxes is not None:
-                    # Calculate all IOUs at once using vectorized operations
                     current_face_ids = [-1] * len(boxes)
                     for i, curr_box in enumerate(boxes):
                         ious = np.array(
@@ -726,22 +726,19 @@ class VideoProcessor:
                         if len(ious) > 0:
                             max_iou_idx = np.argmax(ious)
                             max_iou = ious[max_iou_idx]
-                            if max_iou > 0.5:  # IOU threshold
+                            if max_iou > 0.5:
                                 current_face_ids[i] = list(prev_boxes.keys())[
                                     max_iou_idx
                                 ]
 
-                    # Assign new IDs to unmatched faces
                     for i in range(len(boxes)):
                         if current_face_ids[i] == -1:
                             current_face_ids[i] = face_id_counter
                             face_id_counter += 1
                 else:
-                    # First frame, assign new IDs to all faces
                     current_face_ids = list(range(len(boxes)))
                     face_id_counter = len(boxes)
 
-                # Update previous boxes for next frame
                 prev_boxes = {
                     face_id: box for face_id, box in zip(current_face_ids, boxes)
                 }
@@ -751,81 +748,67 @@ class VideoProcessor:
                     if score < 0.9:
                         continue
 
-                    # Get face crop
+                    # Get face crop with margin
                     x1, y1, x2, y2 = map(int, box[:4])
                     w, h = x2 - x1, y2 - y1
-
-                    # Add margin
                     margin_x = int(w * self.config.face_margin_factor)
                     margin_y = int(h * self.config.face_margin_factor)
-
                     x1 = max(0, x1 - margin_x)
                     y1 = max(0, y1 - margin_y)
                     x2 = min(frame.shape[1], x2 + margin_x)
                     y2 = min(frame.shape[0], y2 + margin_y)
-
                     face_crop = frame[y1:y2, x1:x2]
 
-                    # Save first frame face crops for debugging
-                    if frame_idx == 0 and self.config.debug_mode:
-                        debug_dir = Path("debug_output")
-                        debug_dir.mkdir(exist_ok=True)
-                        Image.fromarray(face_crop).save(
-                            debug_dir / f"face_{face_idx}_crop.png"
-                        )
-
                     # Get landmarks
-                    face_landmarks = self.landmark_detector.get_landmarks(face_crop)
-                    if face_landmarks is None:
-                        self.logger.debug(
-                            f"No landmarks detected for face {face_idx} in frame {frame_idx}"
-                        )
+                    landmarks = self.landmark_detector.get_landmarks(face_crop)
+                    if landmarks is None:
                         continue
 
-                    # Convert cropped face to PIL and resize
-                    face_pil = Image.fromarray(face_crop)
-                    face_pil = resize_face(face_pil)
-                    face_np = np.array(face_pil)
+                    # Add landmarks to queue for smoothing
+                    q_landmarks.append(landmarks[0])
 
-                    # Scale landmarks to match resized face
-                    scale_x = 256 / face_crop.shape[1]
-                    scale_y = 256 / face_crop.shape[0]
-                    landmarks_scaled = face_landmarks[0].copy()
-                    landmarks_scaled[:, 0] *= scale_x
-                    landmarks_scaled[:, 1] *= scale_y
+                    if len(q_landmarks) == self.config.window_margin:
+                        # Get smoothed landmarks
+                        smoothed_landmarks = np.mean(q_landmarks, axis=0)
 
-                    # Get mouth landmarks and center
-                    mouth_landmarks = landmarks_scaled[
-                        self.config.start_idx : self.config.stop_idx
-                    ]
-                    mouth_center = np.mean(mouth_landmarks, axis=0)
-
-                    # Crop 96x96 around mouth center
-                    half_size = 44  # 88/2
-                    start_x = int(max(0, mouth_center[0] - half_size))
-                    end_x = int(min(256, mouth_center[0] + half_size))
-                    start_y = int(max(0, mouth_center[1] - half_size))
-                    end_y = int(min(256, mouth_center[1] + half_size))
-
-                    # Crop mouth region
-                    mouth_crop = face_np[start_y:end_y, start_x:end_x]
-                    mouth_pil = Image.fromarray(mouth_crop)
-                    mouth_pil = to_gray(mouth_pil)
-                    mouth_tensor = to_tensor(mouth_pil)
-
-                    # Store processed frame with face ID
-                    face_id = current_face_ids[face_idx]
-                    if face_id not in face_frames:
-                        face_frames[face_id] = []
-                    face_frames[face_id].append(mouth_tensor)
-
-                    if self.config.debug_mode:
-                        self._visualize_debug(
-                            face_np,
-                            landmarks_scaled,
-                            np.array(mouth_pil),
-                            f"frame_{frame_idx}_face_{face_id}",
+                        # Align face using stable points
+                        warped_face, transform = self._warp_frame(
+                            face_crop,
+                            smoothed_landmarks[self.config.stable_points],
+                            self.mean_face_landmarks[self.config.stable_points],
                         )
+
+                        # Transform landmarks to aligned face space
+                        aligned_landmarks = transform(smoothed_landmarks)
+
+                        # Crop mouth region
+                        mouth_landmarks = aligned_landmarks[
+                            self.config.start_idx : self.config.stop_idx
+                        ]
+                        mouth_center = np.mean(mouth_landmarks, axis=0)
+
+                        half_size = self.config.crop_height // 2
+                        start_x = int(max(0, mouth_center[0] - half_size))
+                        end_x = int(
+                            min(self.config.std_size[0], mouth_center[0] + half_size)
+                        )
+                        start_y = int(max(0, mouth_center[1] - half_size))
+                        end_y = int(
+                            min(self.config.std_size[1], mouth_center[1] + half_size)
+                        )
+
+                        mouth_crop = warped_face[start_y:end_y, start_x:end_x]
+
+                        # Convert to grayscale and tensor
+                        mouth_pil = Image.fromarray(mouth_crop)
+                        mouth_pil = to_gray(mouth_pil)
+                        mouth_tensor = to_tensor(mouth_pil)
+
+                        # Store processed frame
+                        face_id = current_face_ids[face_idx]
+                        if face_id not in face_frames:
+                            face_frames[face_id] = []
+                        face_frames[face_id].append(mouth_tensor)
 
             except Exception as e:
                 self.logger.error(f"Error processing frame {frame_idx}: {str(e)}")
@@ -899,7 +882,7 @@ class VideoProcessor:
     def _warp_frame(
         self, frame: np.ndarray, src_points: np.ndarray, dst_points: np.ndarray
     ) -> Tuple[np.ndarray, tf.ProjectiveTransform]:
-        """Warp frame to align with mean face landmarks"""
+        """Warp frame to align with mean face landmarks using similarity transform"""
         tform = tf.estimate_transform("similarity", src_points, dst_points)
         warped = tf.warp(
             frame, inverse_map=tform.inverse, output_shape=self.config.std_size
