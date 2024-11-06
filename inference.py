@@ -2,20 +2,19 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Union, Dict
+from typing import Dict, List, Tuple, Union
 
+import cv2
 import face_alignment
 import matplotlib.pyplot as plt
 import numpy as np
+import onnxruntime as ort
 import torch
 from facenet_pytorch import MTCNN
 from PIL import Image
 from skimage import transform as tf
 from torchvision import transforms
 from torchvision.transforms import CenterCrop, Compose
-
-import cv2
-import onnxruntime as ort
 
 # ============= Helper Functions =============
 
@@ -611,17 +610,49 @@ class VideoProcessor:
             # Process final probabilities for all accumulated frames
             face_probabilities = {}
             for face_id, frames in all_face_frames.items():
+                self.logger.info(f"\nProcessing face ID {face_id}:")
+                self.logger.info(f"Total frames collected for face: {len(frames)}")
+
                 if len(frames) >= self.config.frames_per_clip:
                     clips, lengths = self._create_clips(frames)
+                    self.logger.info(
+                        f"Created {len(clips)} clips from {len(frames)} frames"
+                    )
+
                     face_probs = []
-                    for clip, length in zip(clips, lengths):
+                    for clip_idx, (clip, length) in enumerate(zip(clips, lengths)):
                         if clip is not None and clip.size(0) > 0:
                             clip = normalize_clip(clip)
                             prob = self._run_inference([clip], [length])
                             if prob is not None and not math.isnan(prob):
                                 face_probs.append(prob)
+                                self.logger.info(
+                                    f"Clip {clip_idx}: probability = {prob:.4f}"
+                                )
+                            else:
+                                self.logger.warning(
+                                    f"Clip {clip_idx}: Invalid probability detected"
+                                )
+                        else:
+                            self.logger.warning(
+                                f"Clip {clip_idx}: Invalid clip detected"
+                            )
+
                     if face_probs:
-                        face_probabilities[face_id] = np.mean(face_probs)
+                        final_prob = np.mean(face_probs)
+                        face_probabilities[face_id] = final_prob
+                        self.logger.info(
+                            f"Face {face_id} final probability (mean of {len(face_probs)} clips): {final_prob:.4f}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"No valid probabilities collected for face {face_id}"
+                        )
+                else:
+                    self.logger.warning(
+                        f"Insufficient frames for face {face_id}. "
+                        f"Got {len(frames)}, need at least {self.config.frames_per_clip}"
+                    )
 
             self.logger.debug(f"Processed {frame_count} frames total")
             self.logger.debug(f"Face probabilities collected: {face_probabilities}")
