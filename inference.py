@@ -1,10 +1,12 @@
 import logging
+import os
 import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 
+import av
 import cv2
 import face_alignment
 import matplotlib.pyplot as plt
@@ -16,424 +18,6 @@ from PIL import Image
 from skimage import transform as tf
 from torchvision import transforms
 from torchvision.transforms import CenterCrop, Compose
-
-# ============= Helper Functions =============
-
-
-# def load_json(json_fp):
-#     with open(json_fp, "r") as f:
-#         json_content = json.load(f)
-#     return json_content
-
-
-# def reshape_tensor(x):
-#     n_batch, n_channels, s_time, sx, sy = x.shape
-#     x = x.transpose(1, 2)
-#     return x.reshape(n_batch * s_time, n_channels, sx, sy)
-
-
-# def _average_batch(x, lengths):
-#     return torch.stack(
-#         [torch.mean(x[index][:, 0:i], 1) for index, i in enumerate(lengths)], 0
-#     )
-
-
-# def downsample_basic_block(inplanes, outplanes, stride):
-#     return nn.Sequential(
-#         nn.Conv2d(inplanes, outplanes, kernel_size=1, stride=stride, bias=False),
-#         nn.BatchNorm2d(outplanes),
-#     )
-
-
-# def conv3x3(in_planes, out_planes, stride=1):
-#     return nn.Conv2d(
-#         in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False
-#     )
-
-
-# # ============= Model Definitions =============
-
-
-# class BasicBlock(nn.Module):
-#     expansion = 1
-
-#     def __init__(self, inplanes, planes, stride=1, downsample=None, relu_type="relu"):
-#         super(BasicBlock, self).__init__()
-#         assert relu_type in ["relu", "prelu"]
-#         self.conv1 = conv3x3(inplanes, planes, stride)
-#         self.bn1 = nn.BatchNorm2d(planes)
-#         self.relu1 = (
-#             nn.PReLU(num_parameters=planes)
-#             if relu_type == "prelu"
-#             else nn.ReLU(inplace=True)
-#         )
-#         self.relu2 = (
-#             nn.PReLU(num_parameters=planes)
-#             if relu_type == "prelu"
-#             else nn.ReLU(inplace=True)
-#         )
-#         self.conv2 = conv3x3(planes, planes)
-#         self.bn2 = nn.BatchNorm2d(planes)
-#         self.downsample = downsample
-#         self.stride = stride
-
-#     def forward(self, x):
-#         residual = x
-#         out = self.conv1(x)
-#         out = self.bn1(out)
-#         out = self.relu1(out)
-#         out = self.conv2(out)
-#         out = self.bn2(out)
-#         if self.downsample is not None:
-#             residual = self.downsample(x)
-#         out += residual
-#         out = self.relu2(out)
-#         return out
-
-
-# class ResNet(nn.Module):
-#     def __init__(
-#         self,
-#         block,
-#         layers,
-#         relu_type="relu",
-#         gamma_zero=False,
-#         avg_pool_downsample=False,
-#     ):
-#         self.inplanes = 64
-#         self.relu_type = relu_type
-#         self.gamma_zero = gamma_zero
-#         self.downsample_block = downsample_basic_block
-#         super(ResNet, self).__init__()
-#         self.layer1 = self._make_layer(block, 64, layers[0])
-#         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-#         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-#         self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-#         self.avgpool = nn.AdaptiveAvgPool2d(1)
-
-#         # default init
-#         for m in self.modules():
-#             if isinstance(m, nn.Conv2d):
-#                 n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-#                 m.weight.data.normal_(0, math.sqrt(2.0 / n))
-#             elif isinstance(m, nn.BatchNorm2d):
-#                 m.weight.data.fill_(1)
-#                 m.bias.data.zero_()
-
-#         if self.gamma_zero:
-#             for m in self.modules():
-#                 if isinstance(m, BasicBlock):
-#                     m.bn2.weight.data.zero_()
-
-#     def _make_layer(self, block, planes, blocks, stride=1):
-#         downsample = None
-#         if stride != 1 or self.inplanes != planes * block.expansion:
-#             downsample = self.downsample_block(
-#                 inplanes=self.inplanes,
-#                 outplanes=planes * block.expansion,
-#                 stride=stride,
-#             )
-
-#         layers = []
-#         layers.append(
-#             block(self.inplanes, planes, stride, downsample, relu_type=self.relu_type)
-#         )
-#         self.inplanes = planes * block.expansion
-#         for i in range(1, blocks):
-#             layers.append(block(self.inplanes, planes, relu_type=self.relu_type))
-#         return nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         x = self.layer1(x)
-#         x = self.layer2(x)
-#         x = self.layer3(x)
-#         x = self.layer4(x)
-#         x = self.avgpool(x)
-#         x = x.view(x.size(0), -1)
-#         return x
-
-
-# class Chomp1d(nn.Module):
-#     def __init__(self, chomp_size, symm_chomp):
-#         super(Chomp1d, self).__init__()
-#         self.chomp_size = chomp_size
-#         self.symm_chomp = symm_chomp
-#         if self.symm_chomp:
-#             assert (
-#                 self.chomp_size % 2 == 0
-#             ), "If symmetric chomp, chomp size needs to be even"
-
-#     def forward(self, x):
-#         if self.chomp_size == 0:
-#             return x
-#         if self.symm_chomp:
-#             return x[:, :, self.chomp_size // 2 : -self.chomp_size // 2].contiguous()
-#         else:
-#             return x[:, :, : -self.chomp_size].contiguous()
-
-
-# class ConvBatchChompRelu(nn.Module):
-#     def __init__(
-#         self,
-#         n_inputs,
-#         n_outputs,
-#         kernel_size,
-#         stride,
-#         dilation,
-#         padding,
-#         relu_type,
-#         dwpw=False,
-#     ):
-#         super(ConvBatchChompRelu, self).__init__()
-#         self.dwpw = dwpw
-#         if dwpw:
-#             self.conv = nn.Sequential(
-#                 nn.Conv1d(
-#                     n_inputs,
-#                     n_inputs,
-#                     kernel_size,
-#                     stride=stride,
-#                     padding=padding,
-#                     dilation=dilation,
-#                     groups=n_inputs,
-#                     bias=False,
-#                 ),
-#                 nn.BatchNorm1d(n_inputs),
-#                 Chomp1d(padding, True),
-#                 (
-#                     nn.PReLU(num_parameters=n_inputs)
-#                     if relu_type == "prelu"
-#                     else nn.ReLU(inplace=True)
-#                 ),
-#                 nn.Conv1d(n_inputs, n_outputs, 1, 1, 0, bias=False),
-#                 nn.BatchNorm1d(n_outputs),
-#                 (
-#                     nn.PReLU(num_parameters=n_outputs)
-#                     if relu_type == "prelu"
-#                     else nn.ReLU(inplace=True)
-#                 ),
-#             )
-#         else:
-#             self.conv = nn.Conv1d(
-#                 n_inputs,
-#                 n_outputs,
-#                 kernel_size,
-#                 stride=stride,
-#                 padding=padding,
-#                 dilation=dilation,
-#             )
-#             self.batchnorm = nn.BatchNorm1d(n_outputs)
-#             self.chomp = Chomp1d(padding, True)
-#             self.non_lin = (
-#                 nn.PReLU(num_parameters=n_outputs)
-#                 if relu_type == "prelu"
-#                 else nn.ReLU()
-#             )
-
-#     def forward(self, x):
-#         if self.dwpw:
-#             return self.conv(x)
-#         else:
-#             out = self.conv(x)
-#             out = self.batchnorm(out)
-#             out = self.chomp(out)
-#             return self.non_lin(out)
-
-
-# class MultibranchTemporalBlock(nn.Module):
-#     def __init__(
-#         self,
-#         n_inputs,
-#         n_outputs,
-#         kernel_sizes,
-#         stride,
-#         dilation,
-#         padding,
-#         dropout=0.2,
-#         relu_type="relu",
-#         dwpw=False,
-#     ):
-#         super(MultibranchTemporalBlock, self).__init__()
-#         self.kernel_sizes = kernel_sizes
-#         self.num_kernels = len(kernel_sizes)
-#         self.n_outputs_branch = n_outputs // self.num_kernels
-#         assert (
-#             n_outputs % self.num_kernels == 0
-#         ), "Number of output channels needs to be divisible by number of kernels"
-
-#         for k_idx, k in enumerate(self.kernel_sizes):
-#             cbcr = ConvBatchChompRelu(
-#                 n_inputs,
-#                 self.n_outputs_branch,
-#                 k,
-#                 stride,
-#                 dilation,
-#                 padding[k_idx],
-#                 relu_type,
-#                 dwpw=dwpw,
-#             )
-#             setattr(self, f"cbcr0_{k_idx}", cbcr)
-#         self.dropout0 = nn.Dropout(dropout)
-
-#         for k_idx, k in enumerate(self.kernel_sizes):
-#             cbcr = ConvBatchChompRelu(
-#                 n_outputs,
-#                 self.n_outputs_branch,
-#                 k,
-#                 stride,
-#                 dilation,
-#                 padding[k_idx],
-#                 relu_type,
-#                 dwpw=dwpw,
-#             )
-#             setattr(self, f"cbcr1_{k_idx}", cbcr)
-#         self.dropout1 = nn.Dropout(dropout)
-
-#         self.downsample = (
-#             nn.Conv1d(n_inputs, n_outputs, 1)
-#             if (n_inputs // self.num_kernels) != n_outputs
-#             else None
-#         )
-#         self.relu_final = (
-#             nn.PReLU(num_parameters=n_outputs) if relu_type == "prelu" else nn.ReLU()
-#         )
-
-#     def forward(self, x):
-#         outputs = []
-#         for k_idx in range(self.num_kernels):
-#             branch_convs = getattr(self, f"cbcr0_{k_idx}")
-#             outputs.append(branch_convs(x))
-#         out0 = torch.cat(outputs, 1)
-#         out0 = self.dropout0(out0)
-
-#         outputs = []
-#         for k_idx in range(self.num_kernels):
-#             branch_convs = getattr(self, f"cbcr1_{k_idx}")
-#             outputs.append(branch_convs(out0))
-#         out1 = torch.cat(outputs, 1)
-#         out1 = self.dropout1(out1)
-
-#         res = x if self.downsample is None else self.downsample(x)
-#         return self.relu_final(out1 + res)
-
-
-# class MultibranchTemporalConvNet(nn.Module):
-#     def __init__(
-#         self,
-#         num_inputs,
-#         num_channels,
-#         tcn_options,
-#         dropout=0.2,
-#         relu_type="relu",
-#         dwpw=False,
-#     ):
-#         super(MultibranchTemporalConvNet, self).__init__()
-#         self.ksizes = tcn_options["kernel_size"]
-#         layers = []
-#         num_levels = len(num_channels)
-#         for i in range(num_levels):
-#             dilation_size = 2**i
-#             in_channels = num_inputs if i == 0 else num_channels[i - 1]
-#             out_channels = num_channels[i]
-#             padding = [(s - 1) * dilation_size for s in self.ksizes]
-#             layers.append(
-#                 MultibranchTemporalBlock(
-#                     in_channels,
-#                     out_channels,
-#                     self.ksizes,
-#                     stride=1,
-#                     dilation=dilation_size,
-#                     padding=padding,
-#                     dropout=dropout,
-#                     relu_type=relu_type,
-#                     dwpw=dwpw,
-#                 )
-#             )
-#         self.network = nn.Sequential(*layers)
-
-#     def forward(self, x):
-#         return self.network(x)
-
-
-# class MultiscaleMultibranchTCN(nn.Module):
-#     def __init__(
-#         self,
-#         input_size,
-#         num_channels,
-#         num_classes,
-#         tcn_options,
-#         dropout,
-#         relu_type,
-#         dwpw=False,
-#     ):
-#         super(MultiscaleMultibranchTCN, self).__init__()
-#         self.kernel_sizes = tcn_options["kernel_size"]
-#         self.num_kernels = len(self.kernel_sizes)
-#         self.mb_ms_tcn = MultibranchTemporalConvNet(
-#             input_size,
-#             num_channels,
-#             tcn_options,
-#             dropout=dropout,
-#             relu_type=relu_type,
-#             dwpw=dwpw,
-#         )
-#         self.tcn_output = nn.Linear(num_channels[-1], num_classes)
-#         self.consensus_func = _average_batch
-
-#     def forward(self, x, lengths):
-#         x = x.transpose(1, 2)
-#         out = self.mb_ms_tcn(x)
-#         out = self.consensus_func(out, lengths)
-#         return self.tcn_output(out)
-
-
-# class Lipreading(nn.Module):
-#     def __init__(
-#         self, hidden_dim=256, num_classes=1, relu_type="prelu", tcn_options={}
-#     ):
-#         super(Lipreading, self).__init__()
-#         self.frontend_nout = 64
-#         self.backend_out = 512
-#         self.trunk = ResNet(BasicBlock, [2, 2, 2, 2], relu_type=relu_type)
-
-#         frontend_relu = (
-#             nn.PReLU(num_parameters=self.frontend_nout)
-#             if relu_type == "prelu"
-#             else nn.ReLU()
-#         )
-#         self.frontend3D = nn.Sequential(
-#             nn.Conv3d(
-#                 1,
-#                 self.frontend_nout,
-#                 kernel_size=(5, 7, 7),
-#                 stride=(1, 2, 2),
-#                 padding=(2, 3, 3),
-#                 bias=False,
-#             ),
-#             nn.BatchNorm3d(self.frontend_nout),
-#             frontend_relu,
-#             nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
-#         )
-#         self.tcn = MultiscaleMultibranchTCN(
-#             input_size=self.backend_out,
-#             num_channels=[
-#                 hidden_dim * len(tcn_options["kernel_size"]) * tcn_options["width_mult"]
-#             ]
-#             * tcn_options["num_layers"],
-#             num_classes=num_classes,
-#             tcn_options=tcn_options,
-#             dropout=tcn_options["dropout"],
-#             relu_type=relu_type,
-#             dwpw=tcn_options["dwpw"],
-#         )
-
-#     def forward(self, x, lengths):
-#         x = self.frontend3D(x)
-#         t_new = x.shape[2]
-#         x = reshape_tensor(x)
-#         x = self.trunk(x)
-#         x = x.view(-1, t_new, x.size(1))
-#         return self.tcn(x, lengths)
 
 
 # ============= Configuration =============
@@ -559,28 +143,27 @@ class VideoProcessor:
         normalize_clip = NormalizeVideo((0.421,), (0.165,))
 
         try:
-            # Initialize video capture
-            self.logger.debug("Loading video frames")
-            cap = cv2.VideoCapture(str(video_path))
-            if not cap.isOpened():
-                raise ValueError("Failed to open video file")
+            # Initialize video capture using av
+            container = av.open(str(video_path))
+            stream = container.streams.video[0]
+
+            # Set stream parameters for faster decoding
+            stream.thread_type = "AUTO"  # Enable multithreaded decoding
+            container.streams.video[0].thread_count = max(1, os.cpu_count() // 2)
 
             # Initialize batch processing
             current_batch = []
-            batch_size = 110  # Adjust as needed
+            batch_size = 110  # Keep original batch size
             frame_count = 0
             all_face_frames = {}  # Accumulate frames for each face across batches
 
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
+            # Decode frames in batches
+            for frame in container.decode(video=0):
                 frame_count += 1
                 frame_idx = frame_count - 1
 
-                # Convert BGR to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert to RGB numpy array efficiently
+                frame_rgb = frame.to_ndarray(format="rgb24")
                 current_batch.append(frame_rgb)
 
                 # Process when batch is full
@@ -589,7 +172,7 @@ class VideoProcessor:
                         f"Processing batch of {len(current_batch)} frames"
                     )
 
-                    # Process batch of frames
+                    # Process batch of frames using numpy array
                     try:
                         batch_face_frames = self._process_mouth_regions_frames(
                             np.array(current_batch)
@@ -607,6 +190,19 @@ class VideoProcessor:
 
                 if frame_idx >= 120:
                     break
+
+            # Process any remaining frames in the last batch
+            if current_batch:
+                try:
+                    batch_face_frames = self._process_mouth_regions_frames(
+                        np.array(current_batch)
+                    )
+                    for face_id, frames in batch_face_frames.items():
+                        if face_id not in all_face_frames:
+                            all_face_frames[face_id] = []
+                        all_face_frames[face_id].extend(frames)
+                except Exception as e:
+                    self.logger.error(f"Error processing final batch: {str(e)}")
 
             # Process final probabilities for all accumulated frames
             face_probabilities = {}
@@ -981,7 +577,7 @@ def main():
     processor.load_model("lipforensics.onnx")  # Changed to load ONNX model
 
     # Process video
-    video_path = "Lip Sync - Musk.mp4"
+    video_path = "Deepfake - Morgon Freeman.mp4"
     try:
         face_probabilities = processor.process_video(video_path)
         for face_id, probability in face_probabilities.items():
